@@ -73,6 +73,12 @@ const (
 	// (ADR-083). Overridable via spec.schedulingStallGraceSeconds.
 	defaultSchedulingStallGrace = 5 * time.Minute
 
+	// defaultWorkloadCreationDeadline bounds how long a rejected workload
+	// create is retried before the Job fails (issue #488). It is independent
+	// of timeoutPerJob, which may be unset, and long enough to cover a
+	// TrainingRuntime created moments before the TrainJob.
+	defaultWorkloadCreationDeadline = 10 * time.Minute
+
 	// Job tier reason constants are in helpers.go.
 
 	// defaultMeasurementTimeout is how long after the Job succeeds to wait for
@@ -114,6 +120,11 @@ type JobReconciler struct {
 	// data before failing threshold validation. If zero, defaults to defaultMeasurementTimeout (5m).
 	MeasurementTimeout time.Duration
 
+	// WorkloadCreationDeadline is how long a rejected workload create is
+	// retried before the Job fails. If zero, defaults to
+	// defaultWorkloadCreationDeadline (10m).
+	WorkloadCreationDeadline time.Duration
+
 	// detectorCache caches compiled CEL detectors by expression string to avoid
 	// recompiling on every reconcile. Protected by detectorCacheMu.
 	detectorCache   map[string]*cel.Detector
@@ -137,6 +148,14 @@ func (r *JobReconciler) getWorkloadRequeueInterval() time.Duration {
 		return r.WorkloadRequeueInterval
 	}
 	return workloadRequeueInterval
+}
+
+// getWorkloadCreationDeadline returns the effective workload creation deadline.
+func (r *JobReconciler) getWorkloadCreationDeadline() time.Duration {
+	if r.WorkloadCreationDeadline > 0 {
+		return r.WorkloadCreationDeadline
+	}
+	return defaultWorkloadCreationDeadline
 }
 
 // getMeasurementTimeout returns the effective timeout for waiting on measurement data
@@ -460,13 +479,7 @@ func (r *JobReconciler) createWorkloadFromSpec(ctx context.Context, job *nvcrev1
 		message = fmt.Sprintf("Workload %s/%s was already created by this Job and has been adopted",
 			gvk.Kind, workloadName)
 	default:
-		// Return the error so controller-runtime applies exponential backoff.
-		// Do not mark the Job as Failed — creation errors are transient
-		// (e.g. webhook denial because TrainingRuntime isn't ready yet).
-		log.Error(createErr, "Failed to create workload, will retry", "kind", gvk.Kind, "name", workloadName)
-		r.warnf(job, ReasonWorkloadCreationError,
-			"Failed to create %s/%s: %v", gvk.Kind, workloadName, createErr)
-		return ctrl.Result{}, fmt.Errorf("failed to create workload: %w", createErr)
+		return r.handleWorkloadCreateError(ctx, job, gvk.Kind, workloadName, createErr)
 	}
 
 	// Set initial InProgress status, recording the workload reference inside
@@ -482,8 +495,10 @@ func (r *JobReconciler) createWorkloadFromSpec(ctx context.Context, job *nvcrev1
 				Name:       workloadName,
 				Namespace:  job.Namespace,
 			}
+			changed := j.Status.WorkloadCreationRejectedSince != nil
+			j.Status.WorkloadCreationRejectedSince = nil
 			if j.Status.WorkloadRef != nil && *j.Status.WorkloadRef == *ref {
-				return false
+				return changed
 			}
 			j.Status.WorkloadRef = ref
 			return true
@@ -492,6 +507,61 @@ func (r *JobReconciler) createWorkloadFromSpec(ctx context.Context, job *nvcrev1
 	}
 
 	return ctrl.Result{RequeueAfter: r.getWorkloadRequeueInterval()}, nil
+}
+
+// isWorkloadCreateRejection reports whether a workload create error is the
+// API server refusing the object (admission webhook or policy denial,
+// ResourceQuota, validation) rather than a failure to reach it. Only
+// rejections run against the workload creation deadline; other errors keep
+// retrying with backoff as before.
+func isWorkloadCreateRejection(err error) bool {
+	return apierrors.IsForbidden(err) || apierrors.IsInvalid(err) || apierrors.IsBadRequest(err)
+}
+
+// handleWorkloadCreateError handles a failed workload create (issue #488).
+// Every failure is returned so controller-runtime retries with backoff,
+// because some rejections clear on their own: a TrainingRuntime that is not
+// ready yet, quota that frees up. A rejection also marks the Job InProgress
+// with WorkloadCreationRejected and starts a persisted clock on the first
+// rejected attempt; once the rejection outlasts the workload creation
+// deadline, the Job fails with the rejection's message. Without that bound a
+// permanent denial, such as an admission policy rule, is retried for as long
+// as the Job exists when timeoutPerJob is unset.
+func (r *JobReconciler) handleWorkloadCreateError(ctx context.Context, job *nvcrev1alpha1.Job,
+	kind, name string, createErr error,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	r.warnf(job, ReasonWorkloadCreationError, "Failed to create %s/%s: %v", kind, name, createErr)
+	if !isWorkloadCreateRejection(createErr) {
+		log.Error(createErr, "Failed to create workload, will retry", "kind", kind, "name", name)
+		return ctrl.Result{}, fmt.Errorf("failed to create workload: %w", createErr)
+	}
+
+	deadline := r.getWorkloadCreationDeadline()
+	if since := job.Status.WorkloadCreationRejectedSince; since != nil && time.Since(since.Time) >= deadline {
+		msg := fmt.Sprintf("Workload %s/%s creation rejected for longer than %s: %v",
+			kind, name, deadline, createErr)
+		log.Info("Workload creation deadline exceeded, failing Job", "kind", kind, "name", name)
+		if err := r.setJobFailed(ctx, job, ReasonWorkloadCreationError, msg); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to update Job status: %w", err)
+		}
+		return ctrl.Result{}, nil
+	}
+
+	log.Error(createErr, "Workload create rejected, will retry", "kind", kind, "name", name)
+	msg := fmt.Sprintf("Workload %s/%s create rejected: %v", kind, name, createErr)
+	if err := r.setJobInProgress(ctx, job, ReasonWorkloadCreationRejected, msg,
+		func(j *nvcrev1alpha1.Job) bool {
+			if j.Status.WorkloadCreationRejectedSince != nil {
+				return false
+			}
+			now := metav1.Now()
+			j.Status.WorkloadCreationRejectedSince = &now
+			return true
+		}); err != nil {
+		log.Error(err, "Failed to record workload creation rejection")
+	}
+	return ctrl.Result{}, fmt.Errorf("failed to create workload: %w", createErr)
 }
 
 // handleWorkloadNotFound handles a cache miss on the Job's workload: it
