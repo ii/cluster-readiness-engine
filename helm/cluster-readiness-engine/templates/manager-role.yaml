@@ -64,6 +64,12 @@ rules:
   - create
   - patch
 - apiGroups:
+  - authorization.k8s.io
+  resources:
+  - selfsubjectaccessreviews
+  verbs:
+  - create
+- apiGroups:
   - nvcre.nvidia.com
   resources:
   - bandwidthmeasurements

@@ -6,6 +6,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +22,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	nvcrev1alpha1 "github.com/NVIDIA/cluster-readiness-engine/api/v1alpha1"
+)
+
+// Events as drainEventTypeReasons reports them.
+const (
+	evWarnCreationError    = "Warning " + ReasonWorkloadCreationError
+	evWarnCreationRejected = "Warning " + ReasonWorkloadCreationRejected
 )
 
 var trainJobsResource = schema.GroupResource{Group: "trainer.kubeflow.org", Resource: "trainjobs"}
@@ -53,55 +60,114 @@ func TestIsWorkloadCreateRejection(t *testing.T) {
 	}
 }
 
+// fakeCreateReviewer answers CanCreate with a fixed verdict and records how
+// often it was asked.
+type fakeCreateReviewer struct {
+	allowed bool
+	err     error
+	asked   int
+}
+
+func (f *fakeCreateReviewer) CanCreate(context.Context, string, schema.GroupResource) (bool, error) {
+	f.asked++
+	return f.allowed, f.err
+}
+
+// TestForbiddenGroupResource checks the review asks about the resource the
+// API server refused.
+func TestForbiddenGroupResource(t *testing.T) {
+	gr, ok := forbiddenGroupResource(apierrors.NewForbidden(trainJobsResource, "tj", errors.New("no")))
+	require.True(t, ok)
+	require.Equal(t, trainJobsResource, gr)
+	_, ok = forbiddenGroupResource(errors.New("plain"))
+	require.False(t, ok)
+}
+
 // TestCreateWorkloadFromSpecRejection covers the create-error paths of
 // createWorkloadFromSpec with no timeoutPerJob in play: a rejection within
 // the deadline keeps the Job InProgress and retrying, one past it fails the
-// Job, a transient error never starts the clock, and a create that
-// succeeds after rejections clears it.
+// Job without recording failed nodes, an RBAC denial or an unconfirmed
+// Forbidden never starts the clock, a transient error never starts it, and a
+// create that succeeds after rejections clears it.
 func TestCreateWorkloadFromSpecRejection(t *testing.T) {
 	forbidden := apierrors.NewForbidden(trainJobsResource, testJobName,
 		errors.New("denied by ValidatingAdmissionPolicy"))
+	invalid := apierrors.NewInvalid(schema.GroupKind{Group: trainJobsResource.Group, Kind: testKindTrainJob},
+		testJobName, field.ErrorList{field.Required(field.NewPath("spec"), "")})
 	transient := apierrors.NewServerTimeout(trainJobsResource, "create", 1)
 
 	tests := []struct {
 		name string
 		// createErr is returned by every TrainJob create; nil lets it through.
 		createErr error
+		// rbacDenied makes the access review deny create; reviewErr makes it fail.
+		rbacDenied bool
+		reviewErr  error
 		// rejectedFor, when non-zero, seeds WorkloadCreationRejectedSince
-		// that long ago.
-		rejectedFor   time.Duration
-		wantErr       bool
-		wantCondition string
-		wantReason    string
-		wantSinceSet  bool
+		// that long ago. alreadyRejected also seeds the InProgress condition.
+		rejectedFor     time.Duration
+		alreadyRejected bool
+		wantErr         bool
+		wantCondition   string
+		wantReason      string
+		wantSinceSet    bool
+		wantReviewAsked bool
+		// wantEvents lists "Type Reason" of every recorded Event.
+		wantEvents []string
 	}{
 		{
 			name: "first rejection starts clock", createErr: forbidden, wantErr: true,
 			wantCondition: nvcrev1alpha1.JobInProgress, wantReason: ReasonWorkloadCreationRejected,
-			wantSinceSet: true,
+			wantSinceSet: true, wantReviewAsked: true,
+			wantEvents: []string{evWarnCreationRejected},
 		},
 		{
-			name: "rejection within deadline keeps retrying", createErr: forbidden,
-			rejectedFor: 5 * time.Minute, wantErr: true,
+			name: "invalid object is a rejection without an access review", createErr: invalid, wantErr: true,
 			wantCondition: nvcrev1alpha1.JobInProgress, wantReason: ReasonWorkloadCreationRejected,
-			wantSinceSet: true,
+			wantSinceSet: true, wantEvents: []string{evWarnCreationRejected},
 		},
 		{
-			name: "rejection past deadline fails job", createErr: forbidden,
-			rejectedFor: 11 * time.Minute, wantErr: false,
+			name: "repeated rejection within deadline emits no event", createErr: forbidden,
+			rejectedFor: 5 * time.Minute, alreadyRejected: true, wantErr: true,
+			wantCondition: nvcrev1alpha1.JobInProgress, wantReason: ReasonWorkloadCreationRejected,
+			wantSinceSet: true, wantReviewAsked: true,
+		},
+		{
+			name: "rejection past deadline fails job without failed nodes", createErr: forbidden,
+			rejectedFor: 11 * time.Minute, alreadyRejected: true, wantErr: false,
 			wantCondition: nvcrev1alpha1.JobFailed, wantReason: ReasonWorkloadCreationError,
-			wantSinceSet: true,
+			wantSinceSet: true, wantReviewAsked: true,
+			wantEvents: []string{evWarnCreationError},
+		},
+		{
+			name: "rbac denial never starts clock", createErr: forbidden, rbacDenied: true,
+			wantErr: true, wantReviewAsked: true,
+			wantEvents: []string{evWarnCreationError},
+		},
+		{
+			name: "rbac denial past deadline still retries", createErr: forbidden, rbacDenied: true,
+			rejectedFor: time.Hour, wantErr: true, wantSinceSet: true, wantReviewAsked: true,
+			wantEvents: []string{evWarnCreationError},
+		},
+		{
+			name: "failed access review never fails job", createErr: forbidden,
+			reviewErr: errors.New("review unavailable"), rejectedFor: time.Hour,
+			wantErr: true, wantSinceSet: true, wantReviewAsked: true,
+			wantEvents: []string{evWarnCreationError},
 		},
 		{
 			name: "transient error does not start clock", createErr: transient, wantErr: true,
+			wantEvents: []string{evWarnCreationError},
 		},
 		{
 			name: "transient error past deadline still retries", createErr: transient,
 			rejectedFor: time.Hour, wantErr: true, wantSinceSet: true,
+			wantEvents: []string{evWarnCreationError},
 		},
 		{
 			name: "create after rejection clears clock", rejectedFor: 5 * time.Minute,
 			wantCondition: nvcrev1alpha1.JobInProgress, wantReason: ReasonWorkloadCreated,
+			wantEvents: []string{"Normal WorkloadCreated"},
 		},
 	}
 	for _, tt := range tests {
@@ -111,9 +177,19 @@ func TestCreateWorkloadFromSpecRejection(t *testing.T) {
 			scheme := newJobLookupWorkloadScheme(t)
 
 			job := newLookupJob(false)
+			// The group's nodes are known: a rejection must still not
+			// attribute the failure to them.
+			job.Annotations = map[string]string{"nvcre.nvidia.com/group-nodes": "gpu-node-01,gpu-node-02"}
 			if tt.rejectedFor > 0 {
 				since := metav1.NewTime(time.Now().Add(-tt.rejectedFor))
 				job.Status.WorkloadCreationRejectedSince = &since
+			}
+			if tt.alreadyRejected {
+				job.Status.Conditions = []metav1.Condition{{
+					Type: nvcrev1alpha1.JobInProgress, Status: metav1.ConditionTrue,
+					Reason: ReasonWorkloadCreationRejected, Message: "Workload TrainJob/" + testJobName + "-workload: " + tt.createErr.Error(),
+					ObservedGeneration: 1, LastTransitionTime: metav1.Now(),
+				}}
 			}
 			createErr := tt.createErr
 			c := fake.NewClientBuilder().WithScheme(scheme).
@@ -132,9 +208,12 @@ func TestCreateWorkloadFromSpecRejection(t *testing.T) {
 			key := client.ObjectKey{Namespace: testNS, Name: testJobName}
 			require.NoError(t, c.Get(ctx, key, job))
 
+			reviewer := &fakeCreateReviewer{allowed: !tt.rbacDenied, err: tt.reviewErr}
+			recorder := events.NewFakeRecorder(20)
 			r := &JobReconciler{
-				Client: c, Scheme: scheme, Recorder: events.NewFakeRecorder(20),
+				Client: c, Scheme: scheme, Recorder: recorder,
 				WorkloadCreationDeadline: 10 * time.Minute,
+				CreateAccessReviewer:     reviewer,
 			}
 			_, err := r.createWorkloadFromSpec(ctx, job)
 			if tt.wantErr {
@@ -142,10 +221,13 @@ func TestCreateWorkloadFromSpecRejection(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
+			require.Equal(t, tt.wantReviewAsked, reviewer.asked > 0)
 
 			got := &nvcrev1alpha1.Job{}
 			require.NoError(t, c.Get(ctx, key, got))
 			require.Equal(t, tt.wantSinceSet, got.Status.WorkloadCreationRejectedSince != nil)
+			require.Empty(t, got.Status.FailedNodes, "a create rejection must not record failed nodes")
+			require.Equal(t, tt.wantEvents, drainEventTypeReasons(recorder))
 			if tt.wantCondition == "" {
 				require.Empty(t, got.Status.Conditions)
 				return
@@ -158,14 +240,31 @@ func TestCreateWorkloadFromSpecRejection(t *testing.T) {
 	}
 }
 
+// drainEventTypeReasons returns "Type Reason" for every Event recorded so far.
+func drainEventTypeReasons(r *events.FakeRecorder) []string {
+	var out []string
+	for {
+		select {
+		case e := <-r.Events:
+			f := strings.Fields(e)
+			if len(f) >= 2 {
+				out = append(out, f[0]+" "+f[1])
+			}
+		default:
+			return out
+		}
+	}
+}
+
 // TestSchedulingBlockedMessageCreationRejected checks that a Job whose
-// workload create is being rejected is relayed to the Workflow.
+// workload create is being rejected is relayed to the Workflow, and that the
+// relayed message says "rejected" once.
 func TestSchedulingBlockedMessageCreationRejected(t *testing.T) {
 	job := &nvcrev1alpha1.Job{}
 	job.Name = "j1"
 	job.Status.Conditions = []metav1.Condition{{
 		Type: nvcrev1alpha1.JobInProgress, Status: metav1.ConditionTrue,
-		Reason: ReasonWorkloadCreationRejected, Message: "denied",
+		Reason: ReasonWorkloadCreationRejected, Message: "Workload TrainJob/j1-workload: denied",
 	}}
-	require.Equal(t, "job j1 creation rejected: denied", schedulingBlockedMessage(job))
+	require.Equal(t, "job j1 creation rejected: Workload TrainJob/j1-workload: denied", schedulingBlockedMessage(job))
 }

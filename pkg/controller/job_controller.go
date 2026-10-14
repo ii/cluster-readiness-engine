@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -73,11 +74,12 @@ const (
 	// (ADR-083). Overridable via spec.schedulingStallGraceSeconds.
 	defaultSchedulingStallGrace = 5 * time.Minute
 
-	// defaultWorkloadCreationDeadline bounds how long a rejected workload
-	// create is retried before the Job fails (issue #488). It is independent
+	// DefaultWorkloadCreationDeadline bounds how long a rejected workload
+	// create is retried before the Job fails (issue #488). cmd/manager's
+	// --workload-creation-deadline overrides it. It is independent
 	// of timeoutPerJob, which may be unset, and long enough to cover a
 	// TrainingRuntime created moments before the TrainJob.
-	defaultWorkloadCreationDeadline = 10 * time.Minute
+	DefaultWorkloadCreationDeadline = 10 * time.Minute
 
 	// Job tier reason constants are in helpers.go.
 
@@ -122,8 +124,13 @@ type JobReconciler struct {
 
 	// WorkloadCreationDeadline is how long a rejected workload create is
 	// retried before the Job fails. If zero, defaults to
-	// defaultWorkloadCreationDeadline (10m).
+	// DefaultWorkloadCreationDeadline (10m).
 	WorkloadCreationDeadline time.Duration
+
+	// CreateAccessReviewer tells an RBAC denial of the workload create from
+	// an admission or quota rejection. If nil, a SelfSubjectAccessReview is
+	// sent through Client.
+	CreateAccessReviewer WorkloadCreateAccessReviewer
 
 	// detectorCache caches compiled CEL detectors by expression string to avoid
 	// recompiling on every reconcile. Protected by detectorCacheMu.
@@ -155,7 +162,7 @@ func (r *JobReconciler) getWorkloadCreationDeadline() time.Duration {
 	if r.WorkloadCreationDeadline > 0 {
 		return r.WorkloadCreationDeadline
 	}
-	return defaultWorkloadCreationDeadline
+	return DefaultWorkloadCreationDeadline
 }
 
 // getMeasurementTimeout returns the effective timeout for waiting on measurement data
@@ -183,6 +190,7 @@ func measurementTimeoutFor(job *nvcrev1alpha1.Job, configured time.Duration) tim
 // +kubebuilder:rbac:groups=trainer.kubeflow.org,resources=trainjobs/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=authorization.k8s.io,resources=selfsubjectaccessreviews,verbs=create
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -479,7 +487,7 @@ func (r *JobReconciler) createWorkloadFromSpec(ctx context.Context, job *nvcrev1
 		message = fmt.Sprintf("Workload %s/%s was already created by this Job and has been adopted",
 			gvk.Kind, workloadName)
 	default:
-		return r.handleWorkloadCreateError(ctx, job, gvk.Kind, workloadName, createErr)
+		return r.handleWorkloadCreateError(ctx, job, gvk, workloadName, createErr)
 	}
 
 	// Set initial InProgress status, recording the workload reference inside
@@ -512,10 +520,72 @@ func (r *JobReconciler) createWorkloadFromSpec(ctx context.Context, job *nvcrev1
 // isWorkloadCreateRejection reports whether a workload create error is the
 // API server refusing the object (admission webhook or policy denial,
 // ResourceQuota, validation) rather than a failure to reach it. Only
-// rejections run against the workload creation deadline; other errors keep
-// retrying with backoff as before.
+// rejections can run against the workload creation deadline; other errors
+// keep retrying with backoff as before. A Forbidden error may still be an
+// RBAC denial, which classifyWorkloadCreateError separates out.
 func isWorkloadCreateRejection(err error) bool {
 	return apierrors.IsForbidden(err) || apierrors.IsInvalid(err) || apierrors.IsBadRequest(err)
+}
+
+// workloadCreateErrorClass is how a failed workload create is handled.
+type workloadCreateErrorClass int
+
+const (
+	// createErrorTransient: the request did not reach a verdict on the
+	// object (timeout, throttling, connection error). Retried unbounded.
+	createErrorTransient workloadCreateErrorClass = iota
+	// createErrorRBACDenied: the controller lacks create permission in the
+	// namespace. Retried unbounded so the Workflow's NamespacePermissionsMissing
+	// wait (ADR-092) decides when to give up, not this deadline.
+	createErrorRBACDenied
+	// createErrorAccessUnknown: Forbidden, but the access review failed, so
+	// RBAC cannot be ruled out. Retried unbounded; the deadline never runs on
+	// an unconfirmed answer.
+	createErrorAccessUnknown
+	// createErrorRejected: admission, policy, quota or validation refused the
+	// object. Runs against the workload creation deadline.
+	createErrorRejected
+)
+
+// classifyWorkloadCreateError sorts a failed workload create (issue #488).
+// A Forbidden create is confirmed with a fresh access review, the way ADR-092
+// does for dependencies: an admission webhook, ValidatingAdmissionPolicy or
+// ResourceQuota denial also comes back Forbidden, and only those count as
+// rejections.
+func (r *JobReconciler) classifyWorkloadCreateError(ctx context.Context, namespace string,
+	gvk schema.GroupVersionKind, createErr error,
+) (workloadCreateErrorClass, error) {
+	if !isWorkloadCreateRejection(createErr) {
+		return createErrorTransient, nil
+	}
+	if !apierrors.IsForbidden(createErr) {
+		return createErrorRejected, nil
+	}
+	gr, ok := forbiddenGroupResource(createErr)
+	if !ok {
+		mapping, err := r.RESTMapper().RESTMapping(gvk.GroupKind(), gvk.Version)
+		if err != nil {
+			return createErrorAccessUnknown, fmt.Errorf("resolve resource for %s: %w", gvk.Kind, err)
+		}
+		gr = mapping.Resource.GroupResource()
+	}
+	allowed, err := r.createAccessReviewer().CanCreate(ctx, namespace, gr)
+	if err != nil {
+		return createErrorAccessUnknown, err
+	}
+	if !allowed {
+		return createErrorRBACDenied, nil
+	}
+	return createErrorRejected, nil
+}
+
+// createAccessReviewer returns the configured reviewer, or one that asks the
+// API server with a SelfSubjectAccessReview.
+func (r *JobReconciler) createAccessReviewer() WorkloadCreateAccessReviewer {
+	if r.CreateAccessReviewer != nil {
+		return r.CreateAccessReviewer
+	}
+	return ssarCreateReviewer{client: r.Client}
 }
 
 // handleWorkloadCreateError handles a failed workload create (issue #488).
@@ -527,14 +597,26 @@ func isWorkloadCreateRejection(err error) bool {
 // deadline, the Job fails with the rejection's message. Without that bound a
 // permanent denial, such as an admission policy rule, is retried for as long
 // as the Job exists when timeoutPerJob is unset.
+//
+// The failure records no failed nodes: nothing ran, and the rejection says
+// nothing about the hardware, so the group's nodes must not reach the
+// Certification's failed-node list (the same as failTimedOutJob).
 func (r *JobReconciler) handleWorkloadCreateError(ctx context.Context, job *nvcrev1alpha1.Job,
-	kind, name string, createErr error,
+	gvk schema.GroupVersionKind, name string, createErr error,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	r.warnf(job, ReasonWorkloadCreationError, "Failed to create %s/%s: %v", kind, name, createErr)
-	if !isWorkloadCreateRejection(createErr) {
+	kind := gvk.Kind
+	class, reviewErr := r.classifyWorkloadCreateError(ctx, job.Namespace, gvk, createErr)
+	switch class {
+	case createErrorTransient, createErrorRBACDenied, createErrorAccessUnknown:
+		if reviewErr != nil {
+			log.Error(reviewErr, "Could not confirm whether a Forbidden workload create is an RBAC denial; "+
+				"retrying without the workload creation deadline", "kind", kind, "name", name)
+		}
 		log.Error(createErr, "Failed to create workload, will retry", "kind", kind, "name", name)
+		r.warnf(job, ReasonWorkloadCreationError, "Failed to create %s/%s: %v", kind, name, createErr)
 		return ctrl.Result{}, fmt.Errorf("failed to create workload: %w", createErr)
+	case createErrorRejected:
 	}
 
 	deadline := r.getWorkloadCreationDeadline()
@@ -542,26 +624,49 @@ func (r *JobReconciler) handleWorkloadCreateError(ctx context.Context, job *nvcr
 		msg := fmt.Sprintf("Workload %s/%s creation rejected for longer than %s: %v",
 			kind, name, deadline, createErr)
 		log.Info("Workload creation deadline exceeded, failing Job", "kind", kind, "name", name)
-		if err := r.setJobFailed(ctx, job, ReasonWorkloadCreationError, msg); err != nil {
+		if err := r.setExclusiveCondition(ctx, job, nvcrev1alpha1.JobFailed, ReasonWorkloadCreationError, msg); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to update Job status: %w", err)
 		}
 		return ctrl.Result{}, nil
 	}
 
-	log.Error(createErr, "Workload create rejected, will retry", "kind", kind, "name", name)
-	msg := fmt.Sprintf("Workload %s/%s create rejected: %v", kind, name, createErr)
-	if err := r.setJobInProgress(ctx, job, ReasonWorkloadCreationRejected, msg,
+	log.Info("Workload create rejected, will retry", "kind", kind, "name", name, "error", createErr.Error())
+	msg := fmt.Sprintf("Workload %s/%s: %v", kind, name, createErr)
+	started, err := r.markWorkloadCreationRejected(ctx, job, msg)
+	if err != nil {
+		log.Error(err, "Failed to record workload creation rejection")
+	}
+	if started {
+		r.warnf(job, ReasonWorkloadCreationRejected, "%s", msg)
+	}
+	return ctrl.Result{}, fmt.Errorf("failed to create workload: %w", createErr)
+}
+
+// markWorkloadCreationRejected sets InProgress/WorkloadCreationRejected and
+// starts the rejection clock if it is not running. It reports whether the
+// Job entered the rejected state on this write, so the caller emits one
+// Warning when the state starts rather than one per retried create.
+func (r *JobReconciler) markWorkloadCreationRejected(ctx context.Context, job *nvcrev1alpha1.Job, msg string) (bool, error) {
+	started := false
+	_, _, err := setExclusiveStatusConditionUnless(ctx, r.Client, job,
+		func(j *nvcrev1alpha1.Job) *[]metav1.Condition { return &j.Status.Conditions },
+		[]string{nvcrev1alpha1.JobInProgress, nvcrev1alpha1.JobSucceeded, nvcrev1alpha1.JobFailed},
+		nvcrev1alpha1.JobInProgress, ReasonWorkloadCreationRejected, msg,
+		r.isTerminalState,
 		func(j *nvcrev1alpha1.Job) bool {
+			cond := meta.FindStatusCondition(j.Status.Conditions, nvcrev1alpha1.JobInProgress)
+			started = cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != ReasonWorkloadCreationRejected
 			if j.Status.WorkloadCreationRejectedSince != nil {
 				return false
 			}
 			now := metav1.Now()
 			j.Status.WorkloadCreationRejectedSince = &now
 			return true
-		}); err != nil {
-		log.Error(err, "Failed to record workload creation rejection")
+		})
+	if err != nil {
+		return false, err
 	}
-	return ctrl.Result{}, fmt.Errorf("failed to create workload: %w", createErr)
+	return started, nil
 }
 
 // handleWorkloadNotFound handles a cache miss on the Job's workload: it

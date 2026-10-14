@@ -107,7 +107,7 @@ func TestIntegration(t *testing.T) {
 			nodePollRecorder = &phaseCountingRecorder{inProgress: make(map[types.UID]int)}
 		}
 		mgr, cancel, stopped := startManager(tt, suite.Config, fakeFetcher, deadline,
-			cfg.RejectWorkflowCreates, checkpoint, nodePollRecorder)
+			cfg, checkpoint, nodePollRecorder)
 
 		// Ensure cleanup always runs, even on test failure/timeout.
 		// Without this, a timed-out test leaks objects (e.g., cluster-scoped
@@ -427,7 +427,7 @@ func deleteTestObjects(t *testing.T, c client.Client, objs []client.Object) {
 
 // startManager creates and starts a controller manager in-process.
 func startManager(
-	t *testing.T, cfg *rest.Config, fetcher podlogs.PodLogFetcher, deadline time.Time, rejectWorkflowCreates bool,
+	t *testing.T, cfg *rest.Config, fetcher podlogs.PodLogFetcher, deadline time.Time, caseCfg waitConfig,
 	checkpoint *checkpointObservation,
 	nodePollRecorder *phaseCountingRecorder,
 ) (ctrl.Manager, context.CancelFunc, <-chan struct{}) {
@@ -459,12 +459,17 @@ func startManager(
 		checkpoint.recorder.EventRecorder = jobRecorder
 		jobRecorder = checkpoint.recorder
 	}
+	jobClient := mgr.GetClient()
+	if marker := caseCfg.RejectWorkloadCreatesWhile; marker != nil {
+		jobClient = &workloadCreateRejectingClient{Client: jobClient, reader: mgr.GetAPIReader(), marker: *marker}
+	}
 	err = (&controller.JobReconciler{
-		Client:                  mgr.GetClient(),
-		Scheme:                  mgr.GetScheme(),
-		Recorder:                jobRecorder,
-		WorkloadRequeueInterval: 1 * time.Second,
-		MeasurementTimeout:      3 * time.Second,
+		Client:                   jobClient,
+		Scheme:                   mgr.GetScheme(),
+		Recorder:                 jobRecorder,
+		WorkloadRequeueInterval:  1 * time.Second,
+		MeasurementTimeout:       3 * time.Second,
+		WorkloadCreationDeadline: time.Duration(caseCfg.WorkloadCreationDeadlineSeconds) * time.Second,
 	}).SetupWithManager(mgr)
 	require.NoError(t, err)
 
@@ -482,7 +487,7 @@ func startManager(
 		nodePollRecorder.EventRecorder = certificationRecorder
 		certificationRecorder = nodePollRecorder
 	}
-	if rejectWorkflowCreates {
+	if caseCfg.RejectWorkflowCreates {
 		certificationClient = &workflowCreateRejectingClient{Client: certificationClient}
 	}
 	err = (&controller.CertificationReconciler{
@@ -616,10 +621,19 @@ type eventTestStep struct {
 }
 
 type waitConfig struct {
-	VerifyNodePollEvents   bool          `json:"verifyNodePollEvents,omitempty"`
-	VerifyCheckpointEvents bool          `json:"verifyCheckpointEvents,omitempty"`
-	RejectWorkflowCreates  bool          `json:"rejectWorkflowCreates,omitempty"`
-	WaitFor                conditionWait `json:"waitFor"`
+	VerifyNodePollEvents   bool `json:"verifyNodePollEvents,omitempty"`
+	VerifyCheckpointEvents bool `json:"verifyCheckpointEvents,omitempty"`
+	RejectWorkflowCreates  bool `json:"rejectWorkflowCreates,omitempty"`
+	// RejectWorkloadCreatesWhile makes the Job controller's workload creates
+	// fail with an admission-style Forbidden while the named ConfigMap
+	// exists, so a step can clear the rejection by deleting it (issue #488).
+	// The SelfSubjectAccessReview still reaches the real API server, which
+	// allows it, so the rejection is classified as admission, not RBAC.
+	RejectWorkloadCreatesWhile *collectSpec `json:"rejectWorkloadCreatesWhile,omitempty"`
+	// WorkloadCreationDeadlineSeconds sets JobReconciler.WorkloadCreationDeadline;
+	// zero keeps the 10m default.
+	WorkloadCreationDeadlineSeconds int           `json:"workloadCreationDeadlineSeconds,omitempty"`
+	WaitFor                         conditionWait `json:"waitFor"`
 	// Steps drive external changes only after observing the preceding state.
 	// All waits and writes share the event case's original deadline.
 	Steps                   []eventTestStep              `json:"steps,omitempty"`
@@ -671,6 +685,32 @@ func (c *workflowCreateRejectingClient) Create(
 	if _, ok := obj.(*nvcrev1alpha1.Workflow); ok {
 		return apierrors.NewForbidden(schema.GroupResource{Group: nvcrev1alpha1.GroupVersion.Group, Resource: "workflows"},
 			obj.GetName(), fmt.Errorf("injected Workflow Create rejection"))
+	}
+	return c.Client.Create(ctx, obj, opts...)
+}
+
+// workloadCreateRejectingClient fails TrainJob creates the way an admission
+// webhook or ValidatingAdmissionPolicy denial does, for as long as the marker
+// ConfigMap exists. Every other call, including the access review, goes to
+// the real API server.
+type workloadCreateRejectingClient struct {
+	client.Client
+	reader client.Reader
+	marker collectSpec
+}
+
+func (c *workloadCreateRejectingClient) Create(
+	ctx context.Context, obj client.Object, opts ...client.CreateOption,
+) error {
+	if _, ok := obj.(*trainerv1alpha1.TrainJob); ok {
+		err := c.reader.Get(ctx, client.ObjectKey{Namespace: c.marker.Namespace, Name: c.marker.Name}, &corev1.ConfigMap{})
+		switch {
+		case err == nil:
+			return apierrors.NewForbidden(schema.GroupResource{Group: trainerv1alpha1.GroupVersion.Group, Resource: "trainjobs"},
+				obj.GetName(), errors.New(`admission webhook "deny.example.com" denied the request: injected rejection`))
+		case !apierrors.IsNotFound(err):
+			return err
+		}
 	}
 	return c.Client.Create(ctx, obj, opts...)
 }
@@ -1441,6 +1481,10 @@ func sanitizeObject(obj client.Object) {
 		// pinning whether a blocked episode is recorded (ADR-083).
 		if o.Status.SchedulingBlockedSince != nil {
 			o.Status.SchedulingBlockedSince = &metav1.Time{Time: time.Unix(0, 0).UTC()}
+		}
+		// workloadCreationRejectedSince is wall clock too (issue #488).
+		if o.Status.WorkloadCreationRejectedSince != nil {
+			o.Status.WorkloadCreationRejectedSince = &metav1.Time{Time: time.Unix(0, 0).UTC()}
 		}
 	case *nvcrev1alpha1.Workflow:
 		clearConditionTimestamps(o.Status.Conditions)

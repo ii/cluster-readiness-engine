@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -67,6 +68,15 @@ func (o controllerConcurrencyOptions) validate() error {
 	return nil
 }
 
+// validateWorkloadCreationDeadline rejects a deadline that would fail every
+// rejected workload create on its first attempt.
+func validateWorkloadCreationDeadline(d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("--workload-creation-deadline must be greater than 0, got %s", d)
+	}
+	return nil
+}
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
@@ -90,6 +100,7 @@ func newRootCommand() *cobra.Command {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	workloadCreationDeadline := controller.DefaultWorkloadCreationDeadline
 	concurrency := controllerConcurrencyOptions{
 		maxConcurrentReconciles:            defaultMaxConcurrentReconciles,
 		measurementMaxConcurrentReconciles: defaultMeasurementMaxConcurrentReconciles,
@@ -105,6 +116,9 @@ func newRootCommand() *cobra.Command {
 		Version: version,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := concurrency.validate(); err != nil {
+				return err
+			}
+			if err := validateWorkloadCreationDeadline(workloadCreationDeadline); err != nil {
 				return err
 			}
 
@@ -212,12 +226,13 @@ func newRootCommand() *cobra.Command {
 			}
 
 			if err := (&controller.JobReconciler{
-				Client:                  mgr.GetClient(),
-				APIReader:               mgr.GetAPIReader(),
-				Scheme:                  mgr.GetScheme(),
-				Clientset:               clientset,
-				Recorder:                mgr.GetEventRecorder("job-controller"),
-				MaxConcurrentReconciles: concurrency.maxConcurrentReconciles,
+				Client:                   mgr.GetClient(),
+				APIReader:                mgr.GetAPIReader(),
+				Scheme:                   mgr.GetScheme(),
+				Clientset:                clientset,
+				Recorder:                 mgr.GetEventRecorder("job-controller"),
+				MaxConcurrentReconciles:  concurrency.maxConcurrentReconciles,
+				WorkloadCreationDeadline: workloadCreationDeadline,
 			}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("unable to create controller Job: %w", err)
 			}
@@ -310,6 +325,11 @@ func newRootCommand() *cobra.Command {
 	cmd.Flags().StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	cmd.Flags().BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+
+	cmd.Flags().DurationVar(&workloadCreationDeadline, "workload-creation-deadline",
+		controller.DefaultWorkloadCreationDeadline,
+		"How long a Job keeps retrying a workload create that the API server rejects "+
+			"(admission webhook or policy denial, ResourceQuota) before it fails. Independent of timeoutPerJob.")
 
 	cmd.Flags().AddGoFlagSet(flag.CommandLine)
 

@@ -45,6 +45,7 @@ spec:
         - --health-probe-bind-address=:8081
         - --max-concurrent-reconciles={{ required "manager.maxConcurrentReconciles is required" .Values.manager.maxConcurrentReconciles }}
         - --measurement-max-concurrent-reconciles={{ required "manager.measurementMaxConcurrentReconciles is required" .Values.manager.measurementMaxConcurrentReconciles }}
+        - --workload-creation-deadline={{ required "manager.workloadCreationDeadline is required" .Values.manager.workloadCreationDeadline }}
         command:
         - /manager
         {{- /*

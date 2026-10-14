@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/NVIDIA/cluster-readiness-engine/pkg/testutil"
 	"github.com/spf13/pflag"
@@ -80,6 +81,37 @@ func TestControllerConcurrencyFlagDefaults(t *testing.T) {
 		}
 
 		data, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return err
+		}
+		tc.Actual = string(data) + "\n"
+		return nil
+	})
+}
+
+// TestValidateWorkloadCreationDeadline pins the --workload-creation-deadline
+// bounds (issue #488): zero or negative would fail every rejected create on
+// its first attempt.
+func TestValidateWorkloadCreationDeadline(t *testing.T) {
+	p := testutil.TestCaseParser{
+		Subdir:         "workload-creation-deadline-validate",
+		ExpectedSuffix: testutil.SuffixJSON,
+	}
+	p.TestDir(t, func(tc *testutil.TestCase) error {
+		var input struct {
+			Deadline string `json:"deadline"`
+		}
+		if err := yaml.UnmarshalStrict([]byte(tc.Inputs["input.yaml"]), &input); err != nil {
+			return err
+		}
+		d, err := time.ParseDuration(input.Deadline)
+		if err != nil {
+			return err
+		}
+		if err := validateWorkloadCreationDeadline(d); err != nil {
+			return err
+		}
+		data, err := json.MarshalIndent(map[string]bool{"valid": true}, "", "  ")
 		if err != nil {
 			return err
 		}
